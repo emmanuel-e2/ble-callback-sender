@@ -65,6 +65,7 @@ func NewCallbackSender(dbPool *pgxpool.Pool) *CallbackSender {
 // Returns *InvalidMessageError (permanent) for bad payloads.
 // Returns transientError for retryable downstream/DB issues.
 func (cs *CallbackSender) Handle(ctx context.Context, payload map[string]any) error {
+	log.Printf("DEBUG - IN HANDLE FUNCTION")
 	deviceID, ok := readStringAny(payload, "deviceId", "device_id", "deviceID")
 	if !ok || deviceID == "" {
 		return &InvalidMessageError{msg: "Missing deviceId"}
@@ -181,18 +182,20 @@ func (cs *CallbackSender) getClientIDByDeviceId(ctx context.Context, deviceID st
 	if err != nil {
 		return 0, fmt.Errorf("invalid device ID hex: %w", err)
 	}
+	log.Printf("device_mac=%x", b)
 	var clientID int64
-	const q = `SELECT client_id FROM devices WHERE device_id = $1`
+	const q = `SELECT client_id FROM devices WHERE device_mac = $1`
 	err = cs.dbPool.QueryRow(ctx, q, b).Scan(&clientID)
 	if err != nil {
 		return 0, err
 	}
+	log.Printf("DEBUG - client ID = %d", clientID)
 	return clientID, nil
 }
 
 func (cs *CallbackSender) getCallbackConfigsByClientId(ctx context.Context, clientID int64) ([]CallbackConfig, error) {
 	const q = `SELECT url, method, headers, is_enabled
-	           FROM callback_configs
+	           FROM callback_config
 	           WHERE client_id = $1`
 	rows, err := cs.dbPool.Query(ctx, q, clientID)
 	if err != nil {
@@ -208,6 +211,7 @@ func (cs *CallbackSender) getCallbackConfigsByClientId(ctx context.Context, clie
 		}
 		res = append(res, c)
 	}
+	log.Printf("DEBUG - callbacks: %x", res)
 	return res, rows.Err()
 }
 
