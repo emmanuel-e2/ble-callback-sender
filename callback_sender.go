@@ -60,25 +60,104 @@ func NewCallbackSender(dbPool *pgxpool.Pool) *CallbackSender {
 	}
 }
 
+func readInt64Any(m map[string]any, keys ...string) (int64, bool) {
+	log.Printf("IN READINT64ANY")
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch t := v.(type) {
+			case float64: // JSON numbers default
+				return int64(t), true
+			case int64:
+				return t, true
+			case int:
+				return int64(t), true
+			case string:
+				if t == "" {
+					continue
+				}
+				// allow decimal strings only here
+				var x int64
+				_, err := fmt.Sscan(t, &x)
+				if err == nil {
+					return x, true
+				}
+			}
+		}
+	}
+	log.Printf("Nothing to read as backendID")
+	return 0, false
+}
+
+// cloneWithoutKeys returns a shallow copy of m excluding any of the given keys.
+func cloneWithoutKeys(m map[string]any, keys ...string) map[string]any {
+	out := make(map[string]any, len(m))
+	blk := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		blk[k] = struct{}{}
+	}
+	for k, v := range m {
+		if _, drop := blk[k]; drop {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func (cs *CallbackSender) storeCallbackJSON(ctx context.Context, backendID int64, payload map[string]any) error {
+	log.Printf("IN STORECALLBACKJSON")
+	log.Printf("backendID = %d", backendID)
+	jsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal callback_json: %w", err)
+	}
+
+	// Short, single-statement write is fine; use a TX only if you later add more writes.
+	const q = `UPDATE backend_message
+               SET callback_json = $2
+               WHERE id = $1`
+	ct, err := cs.dbPool.Exec(ctx, q, backendID, jsonBytes)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		// If the row doesn't exist, treat as permanent or transient depending on your choice.
+		// Permanent is safer to avoid infinite retries:
+		return &InvalidMessageError{msg: fmt.Sprintf("backend_message id %d not found", backendID)}
+	}
+	return nil
+}
+
 // Handle receives parsed payload and fan-outs to per-client callbacks.
 // Returns nil on success.
 // Returns *InvalidMessageError (permanent) for bad payloads.
 // Returns transientError for retryable downstream/DB issues.
 func (cs *CallbackSender) Handle(ctx context.Context, payload map[string]any) error {
 	log.Printf("DEBUG - IN HANDLE FUNCTION")
-	deviceID, ok := readStringAny(payload, "deviceId", "device_id", "deviceID")
-	if !ok || deviceID == "" {
-		return &InvalidMessageError{msg: "Missing deviceId"}
+	log.Printf("payload = %v", payload)
+
+	backendID, ok := readInt64Any(payload, "backend_id", "backendId", "backendID", "BackendID")
+	if !ok || backendID <= 0 {
+		return &InvalidMessageError{msg: "Missing or invalid backend_id"}
 	}
 
-	clientID, err := cs.getClientIDByDeviceId(ctx, deviceID)
+	body := cloneWithoutKeys(payload, "backend_id", "backendID", "BackendID")
+
+	log.Printf("IN HANDLE: backendID=%d", backendID)
+
+	if err := cs.storeCallbackJSON(ctx, backendID, body); err != nil {
+		// Any DB connectivity issue => transient
+		return transient(fmt.Errorf("storeCallbackJSON: %w", err))
+	}
+
+	clientID, err := cs.getClientIDByBackendID(ctx, backendID)
 	if err != nil {
 		// Unknown device is permanent (ack & drop)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return &InvalidMessageError{msg: fmt.Sprintf("device %s not found", deviceID)}
+			return &InvalidMessageError{msg: fmt.Sprintf("backend_id %d not found", backendID)}
 		}
 		// Other DB errors → transient
-		return transient(fmt.Errorf("getClientID: %w", err))
+		return transient(fmt.Errorf("getClientIDByBackendID: %w", err))
 	}
 
 	configs, err := cs.getCallbackConfigsByClientId(ctx, clientID)
@@ -176,6 +255,27 @@ func (cs *CallbackSender) SendCallback(ctx context.Context, url, method string, 
 }
 
 // DB helpers
+
+func (cs *CallbackSender) getClientIDByBackendID(ctx context.Context, backendID int64) (int64, error) {
+	// 1) find device_id (BYTEA) in backend_message
+	var devBytes []byte
+	if err := cs.dbPool.QueryRow(ctx,
+		`SELECT device_id FROM backend_message WHERE id = $1`,
+		backendID,
+	).Scan(&devBytes); err != nil {
+		return 0, err
+	}
+
+	// 2) map device_mac -> client_id
+	var clientID int64
+	if err := cs.dbPool.QueryRow(ctx,
+		`SELECT client_id FROM devices WHERE device_mac = $1`,
+		devBytes,
+	).Scan(&clientID); err != nil {
+		return 0, err
+	}
+	return clientID, nil
+}
 
 func (cs *CallbackSender) getClientIDByDeviceId(ctx context.Context, deviceID string) (int64, error) {
 	b, err := hexToBytes(deviceID)
